@@ -1,21 +1,23 @@
-import lockfile from 'proper-lockfile';
 import * as logger from '../../shared/logging/logger.js';
+import { acquireFileLock, LockBusyError, cleanupStaleLock } from '../../shared/fs/fileLock.js';
 
 /**
  * Service for managing file system lock on the agent registry
  * Prevents race conditions when multiple processes access registry.json simultaneously
  *
- * Uses proper-lockfile for cross-process locking with:
- * - Stale lock detection (30s timeout)
- * - Automatic retry with exponential backoff
- * - Graceful degradation on lock failures
+ * Uses a simple sentinel file that is created with O_EXCL semantics.
  */
 export class RegistryLockService {
   private registryPath: string;
-  private activeLock: (() => Promise<void>) | null = null;
+  private releaseHandle: (() => Promise<void>) | null = null;
+  private lockFilePath: string;
 
   constructor(registryPath: string) {
     this.registryPath = registryPath;
+    this.lockFilePath = `${registryPath}.lock`;
+    cleanupStaleLock(this.lockFilePath).catch(err => {
+      logger.debug(`Failed to cleanup stale registry lock (${this.lockFilePath}): ${err}`);
+    });
   }
 
   /**
@@ -28,7 +30,7 @@ export class RegistryLockService {
     try {
       const lockPath = this.registryPath;
 
-      // Ensure file exists before locking (proper-lockfile requires this)
+      // Ensure registry file exists before locking so downstream code never sees ENOENT
       // Use synchronous operations to prevent race conditions during file creation
       const { existsSync, mkdirSync, writeFileSync } = await import('fs');
       const { dirname } = await import('path');
@@ -45,27 +47,25 @@ export class RegistryLockService {
         logger.debug(`Created registry file for locking: ${lockPath}`);
       }
 
-      // Acquire lock with proper-lockfile
-      const release = await lockfile.lock(lockPath, {
-        stale: 30000, // 30 second stale timeout to prevent deadlocks
-        retries: {
-          retries: 5, // More retries for registry (higher contention)
-          minTimeout: 50,
-          maxTimeout: 500,
-        },
-        realpath: false, // Don't resolve symlinks
-        lockfilePath: `${lockPath}.lock`, // Explicit lock file path
+      const release = await acquireFileLock(this.lockFilePath, {
+        staleMs: 45_000,
+        retries: 10,
+        retryDelayMs: 150,
+        description: 'registry',
       });
 
-      this.activeLock = release;
+      this.releaseHandle = release;
       logger.debug(`Acquired lock for registry: ${this.registryPath}`);
 
       return release;
     } catch (error) {
-      logger.error(`CRITICAL: Failed to acquire lock for registry ${this.registryPath}: ${error}`);
-      // DO NOT silently degrade - throw error for critical operations
-      // This prevents data corruption from unprotected concurrent access
-      throw new Error(`Failed to acquire registry lock: ${error}`);
+      const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof LockBusyError) {
+        logger.warn(`Registry lock degraded (best-effort): ${message}`);
+        return async () => {};
+      }
+      logger.error(`CRITICAL: Failed to acquire lock for registry ${this.registryPath}: ${message}`);
+      throw new Error(`Failed to acquire registry lock: ${message}`);
     }
   }
 
@@ -73,16 +73,14 @@ export class RegistryLockService {
    * Release the registry lock
    */
   async releaseLock(): Promise<void> {
-    if (this.activeLock) {
+    if (this.releaseHandle) {
       try {
-        await this.activeLock();
-        this.activeLock = null;
+        await this.releaseHandle();
         logger.debug(`Released lock for registry: ${this.registryPath}`);
       } catch (error) {
         logger.warn(`Failed to release lock for registry ${this.registryPath}: ${error}`);
-        // Still clear the lock reference
-        this.activeLock = null;
       }
+      this.releaseHandle = null;
     }
   }
 
@@ -103,6 +101,6 @@ export class RegistryLockService {
    * Check if the registry is currently locked by this instance
    */
   isLocked(): boolean {
-    return this.activeLock !== null;
+    return this.releaseHandle !== null;
   }
 }

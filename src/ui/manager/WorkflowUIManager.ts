@@ -209,6 +209,13 @@ export class WorkflowUIManager {
     }
   }
 
+  /**
+   * Update agent engine (displayed in UI sidebar)
+   */
+  updateAgentEngine(agentId: string, engine: EngineType): void {
+    this.state.updateAgentEngine(agentId, engine);
+  }
+
 
   /**
    * Set loop state

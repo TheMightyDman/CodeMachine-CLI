@@ -91,6 +91,37 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
 
   debug(`Using workflow template: ${template.name}`);
 
+  const rawEngineOverride = options.engineOverride ?? process.env.CODEMACHINE_ENGINE_OVERRIDE;
+  const normalizedEngineOverride = typeof rawEngineOverride === 'string' && rawEngineOverride.trim()
+    ? rawEngineOverride.trim().toLowerCase()
+    : undefined;
+  const engineOverrideModule = normalizedEngineOverride ? registry.get(normalizedEngineOverride) : undefined;
+  if (normalizedEngineOverride && !engineOverrideModule) {
+    const available = registry.getAllIds().join(', ');
+    throw new Error(`Unknown engine override "${rawEngineOverride}". Available engines: ${available}`);
+  }
+  const engineOverrideSource = options.engineOverride
+    ? 'cli'
+    : process.env.CODEMACHINE_ENGINE_OVERRIDE
+      ? 'env'
+      : undefined;
+
+  const findFallbackEngine = async () => {
+    const engines = registry.getAll();
+    for (const engine of engines) {
+      const isAuth = await authCache.isAuthenticated(
+        engine.metadata.id,
+        () => engine.auth.isAuthenticated()
+      );
+      if (isAuth) {
+        return engine;
+      }
+    }
+    return registry.getDefault() ?? null;
+  };
+
+  const overrideEngineId = engineOverrideModule?.metadata.id;
+
   // Sync agent configurations before running the workflow
   const workflowAgents = Array.from(
     template.steps
@@ -135,12 +166,12 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
   // Pre-populate timeline with all workflow steps BEFORE starting UI
   // This prevents duplicate renders at startup
   // Set initial status based on completion tracking
+  const defaultEngine = registry.getDefault();
+
   template.steps.forEach((step, stepIndex) => {
     if (step.type === 'module') {
-      const defaultEngine = registry.getDefault();
-      const engineType = step.engine ?? defaultEngine?.metadata.id ?? 'unknown';
-      const engineName = engineType; // preserve original engine type, even if unknown
-
+      const engineType = overrideEngineId ?? step.engine ?? defaultEngine?.metadata.id ?? 'unknown';
+      
       // Create a unique identifier for each step instance (agentId + stepIndex)
       // This allows multiple instances of the same agent to appear separately in the UI
       const uniqueAgentId = `${step.agentId}-step-${stepIndex}`;
@@ -151,7 +182,7 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
         initialStatus = 'completed';
       }
 
-      const agentId = ui.addMainAgent(step.agentName ?? step.agentId, engineName, stepIndex, initialStatus, uniqueAgentId);
+      const agentId = ui.addMainAgent(step.agentName ?? step.agentId, engineType, stepIndex, initialStatus, uniqueAgentId);
 
       // Update agent with step information
       const state = ui.getState();
@@ -232,45 +263,50 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
     // Mark step as started (adds to notCompletedSteps)
     await markStepStarted(cmRoot, index);
 
-    // Determine engine: step override > first authenticated engine
-    let engineType: string;
-    if (step.engine) {
-      engineType = step.engine;
+    // Determine engine: global override > step config > first authenticated engine
+    let engineType: string | undefined;
+    const preferredEngineId = overrideEngineId ?? step.engine;
 
-      // If an override is provided but not authenticated, log and fall back
-      const overrideEngine = registry.get(engineType);
-      const isOverrideAuthed = overrideEngine
-        ? await authCache.isAuthenticated(overrideEngine.metadata.id, () => overrideEngine.auth.isAuthenticated())
-        : false;
-      if (!isOverrideAuthed) {
-        const pretty = overrideEngine?.metadata.name ?? engineType;
+    if (preferredEngineId) {
+      const preferredEngine = registry.get(preferredEngineId);
+
+      if (!preferredEngine) {
         console.error(
           formatAgentLog(
             step.agentId,
-            `${pretty} override is not authenticated; falling back to first authenticated engine by order. Run 'codemachine auth login' to use ${pretty}.`,
+            `Unknown engine '${preferredEngineId}' configured; falling back to first authenticated engine.`,
           ),
         );
-
-        // Find first authenticated engine by order (with caching)
-        const engines = registry.getAll();
-        let fallbackEngine = null as typeof overrideEngine | null;
-        for (const eng of engines) {
-          const isAuth = await authCache.isAuthenticated(
-            eng.metadata.id,
-            () => eng.auth.isAuthenticated()
-          );
-          if (isAuth) {
-            fallbackEngine = eng;
-            break;
-          }
-        }
-
-        // If none authenticated, fall back to registry default (may still require auth)
+        const fallbackEngine = await findFallbackEngine();
         if (!fallbackEngine) {
-          fallbackEngine = registry.getDefault() ?? null;
+          throw new Error('No engines registered. Please install at least one engine.');
         }
+        engineType = fallbackEngine.metadata.id;
+        console.log(
+          formatAgentLog(
+            step.agentId,
+            `Falling back to ${fallbackEngine.metadata.name} (${engineType})`,
+          ),
+        );
+      } else {
+        const isPreferredAuthed = await authCache.isAuthenticated(
+          preferredEngine.metadata.id,
+          () => preferredEngine.auth.isAuthenticated()
+        );
 
-        if (fallbackEngine) {
+        if (!isPreferredAuthed) {
+          const pretty = preferredEngine.metadata.name ?? preferredEngineId;
+          const prefix = overrideEngineId ? 'Engine override' : `${step.agentName} configuration`;
+          console.error(
+            formatAgentLog(
+              step.agentId,
+              `${prefix} ${pretty} is not authenticated; falling back to first authenticated engine by order. Run 'codemachine auth login' to use ${pretty}.`,
+            ),
+          );
+          const fallbackEngine = await findFallbackEngine();
+          if (!fallbackEngine) {
+            throw new Error('No engines registered. Please install at least one engine.');
+          }
           engineType = fallbackEngine.metadata.id;
           console.log(
             formatAgentLog(
@@ -278,47 +314,46 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
               `Falling back to ${fallbackEngine.metadata.name} (${engineType})`,
             ),
           );
+        } else {
+          engineType = preferredEngine.metadata.id;
+          if (overrideEngineId) {
+            const sourceLabel = engineOverrideSource === 'cli' ? 'CLI engine override' : 'Engine override';
+            ui.logMessage(uniqueAgentId, `${sourceLabel}: ${preferredEngine.metadata.name} (${engineType})`);
+          }
         }
       }
     } else {
-      // Fallback: find first authenticated engine by order (with caching)
-      const engines = registry.getAll();
-      let foundEngine = null;
-
-      for (const engine of engines) {
-        const isAuth = await authCache.isAuthenticated(
-          engine.metadata.id,
-          () => engine.auth.isAuthenticated()
-        );
-        if (isAuth) {
-          foundEngine = engine;
-          break;
-        }
-      }
-
-      if (!foundEngine) {
-        // If no authenticated engine, use default (first by order)
-        foundEngine = registry.getDefault();
-      }
-
-      if (!foundEngine) {
+      const fallbackEngine = await findFallbackEngine();
+      if (!fallbackEngine) {
         throw new Error('No engines registered. Please install at least one engine.');
       }
+      engineType = fallbackEngine.metadata.id;
+      ui.logMessage(uniqueAgentId, `No engine specified, using ${fallbackEngine.metadata.name} (${engineType})`);
+    }
 
-      engineType = foundEngine.metadata.id;
-      ui.logMessage(uniqueAgentId, `No engine specified, using ${foundEngine.metadata.name} (${engineType})`);
+    if (!engineType) {
+      throw new Error('No engines registered. Please install at least one engine.');
     }
 
     // Ensure the selected engine is used during execution
     // (executeStep falls back to default engine if step.engine is unset)
     // Mutate current step to carry the chosen engine forward
+    ui.updateAgentEngine(uniqueAgentId, engineType);
     step.engine = engineType;
+
+    // Set up skip listener and abort controller for this step EARLY so it also covers fallback execution
+    const abortController = new AbortController();
+    const skipListener = () => {
+      ui.logMessage(uniqueAgentId, '⏭️  Skip requested by user...');
+      abortController.abort();
+    };
+    process.once('workflow:skip', skipListener);
 
     // Check if fallback should be executed before the original step
     if (shouldExecuteFallback(step, index, notCompletedSteps)) {
       ui.logMessage(uniqueAgentId, `Detected incomplete step. Running fallback agent first.`);
       try {
-        await executeFallbackStep(step, cwd, workflowStartTime, engineType, ui, uniqueAgentId);
+        await executeFallbackStep(step, cwd, workflowStartTime, engineType, ui, uniqueAgentId, abortController.signal);
       } catch (error) {
         // Fallback failed, step remains in notCompletedSteps
         console.error(
@@ -331,14 +366,6 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
         throw error;
       }
     }
-
-    // Set up skip listener and abort controller for this step
-    const abortController = new AbortController();
-    const skipListener = () => {
-      ui.logMessage(uniqueAgentId, '⏭️  Skip requested by user...');
-      abortController.abort();
-    };
-    process.once('workflow:skip', skipListener);
 
     try {
       const output = await executeStep(step, cwd, {
@@ -354,16 +381,16 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
       if (triggerResult?.shouldTrigger && triggerResult.triggerAgentId) {
         const triggeredAgentId = triggerResult.triggerAgentId; // Capture for use in callbacks
         try {
-          await executeTriggerAgent({
-            triggerAgentId: triggeredAgentId,
-            cwd,
-            engineType,
-            logger: () => {}, // No-op: UI reads from log files
-            stderrLogger: () => {}, // No-op: UI reads from log files
-            sourceAgentId: uniqueAgentId,
-            ui,
-            abortSignal: abortController.signal,
-          });
+        await executeTriggerAgent({
+          triggerAgentId: triggeredAgentId,
+          cwd,
+          engineType,
+          logger: () => {}, // No-op: UI reads from log files
+          stderrLogger: () => {}, // No-op: UI reads from log files
+          sourceAgentId: uniqueAgentId,
+          ui,
+          abortSignal: abortController.signal,
+        });
         } catch (triggerError) {
           // Check if this was a user-requested skip (abort)
           if (triggerError instanceof Error && triggerError.name === 'AbortError') {

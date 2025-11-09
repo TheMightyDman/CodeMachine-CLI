@@ -66,6 +66,7 @@ export interface RunWorkflowOptions {
   cwd?: string;
   templatePath?: string;
   specificationPath?: string;
+  engineOverride?: string;
 }
 
 export interface TaskManagerOptions {

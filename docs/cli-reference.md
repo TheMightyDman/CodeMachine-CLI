@@ -426,6 +426,7 @@ Authentication management for AI engine providers.
 **Subcommands:**
 - `auth login` - Authenticate with a provider
 - `auth logout` - Logout from a provider
+- `auth status` - Inspect authentication status/details
 
 ---
 
@@ -478,6 +479,26 @@ codemachine auth login
 
 **Use Cases:**
 - Initial setup of AI engines
+
+---
+
+#### `auth status`
+
+Inspect authentication status for a selected provider.
+
+**Syntax:**
+```bash
+codemachine auth status
+```
+
+**Behavior:**
+- Shows the same provider selection menu as `auth login`/`logout`.
+- For Kimi CLI, prints detailed diagnostics: platform, CLI availability, inline env presence, resolved project root, override path, and every auth source (environment variables, override file, project file, legacy tmp) with existence/permissions info.
+- For other providers, displays a concise ready/not ready message based on `isAuthenticated()`.
+
+**Use Cases:**
+- Debugging “already authenticated” vs missing key scenarios.
+- Verifying which auth file (`CODEMACHINE_KIMI_AUTH_FILE`, project `.codemachine/kimi/auth.env`, or tmp) contains the stored key.
 - Re-authenticate expired sessions
 - Switch between different provider accounts
 - Enable new engines in workspace
@@ -598,6 +619,9 @@ codemachine codex run "my-agent 'Generate code'"
 # Cursor engine variant
 codemachine cursor run "my-agent 'Generate code'"
 
+# Kimi engine variant
+codemachine kimi run "my-agent 'Generate code'"
+
 # OpenCode engine variant
 codemachine opencode run "build hello world"
 ```
@@ -616,11 +640,27 @@ codemachine opencode run "build hello world"
 
 The OpenCode provider needs explicit permission defaults to stay non-interactive. When you run `codemachine opencode ...` or `--engine opencode`, the CLI injects (unless already set):
 
-- `OPENCODE_PERMISSION={"edit":"allow","webfetch":"allow","bash":{"*":"allow"}}`
+- `OPENCODE_PERMISSION={"*":"allow","bash":{"*":"allow"}}`
 - `OPENCODE_DISABLE_LSP_DOWNLOAD=1` and `OPENCODE_DISABLE_DEFAULT_PLUGINS=1`
 - `OPENCODE_CONFIG_DIR=$HOME/.codemachine/opencode` (can be overridden)
 
 You can also set `CODEMACHINE_SKIP_OPENCODE=1` to dry-run pipelines without launching the CLI, or `CODEMACHINE_PLAIN_LOGS=1` to strip ANSI markers in log exports.
+
+When OpenCode introduces a permission that is not covered by your current policy, CodeMachine now pauses execution, surfaces the request via the standard selection menu (`Allow once / Always allow / Reject`), rewrites `OPENCODE_PERMISSION` accordingly, and retries the run. Choosing **Always allow** remembers the approval for the current CLI session so subsequent steps inherit the updated policy automatically.
+
+Important: Disable OpenCode sub‑agents. CodeMachine coordinates sub‑agents at the workflow level and does not yet handle OpenCode’s engine‑native sub‑agents. Keeping them enabled can disconnect the OpenCode process and provides no benefit because CodeMachine already scopes tasks to a single agent.
+
+### Kimi CLI Integration Notes
+
+- Install with `uv tool install --python 3.13 kimi-cli` and export `KIMI_API_KEY` (plus optional `KIMI_BASE_URL` / `KIMI_MODEL_NAME`).
+- `codemachine auth login` prompts for the API key (masked) and stores it at `<project>/.codemachine/kimi/auth.env` (0600). Override with `CODEMACHINE_KIMI_AUTH_FILE`, inspect via `codemachine auth status`, and remove with `codemachine auth logout`.
+- If `KIMI_BASE_URL` / `KIMI_MODEL_NAME` are unset we default to `https://api.kimi.com/coding/v1` and `kimi-for-coding` so print/wire mode works even when the upstream config file is empty.
+- Pin the project root used for `.codemachine/kimi/auth.env` with `CODEMACHINE_PROJECT_ROOT=/absolute/workspace/path` when running from nested directories or CI sandboxes.
+- Override the exact CLI path via `CODEMACHINE_KIMI_BINARY=/full/path/to/kimi` if you keep multiple installations around; otherwise we resolve `kimi` on `PATH`.
+- Default print mode (`kimi --print`) streams JSONL for resilient CI runs. Set `CODEMACHINE_KIMI_MODE=wire` when you need the JSON-RPC wire UI (step/tool/status fidelity). Wire mode auto-approves CLI prompts.
+- Provide additional MCP definitions through `KIMI_MCP_CONFIG_FILES=/path/a.json,/path/b.json`.
+- `CODEMACHINE_SKIP_KIMI=1` performs dry-runs; `CODEMACHINE_PLAIN_LOGS=1` strips ANSI sequences from streamed output.
+- Windows is not currently supported by the upstream CLI—use macOS, Linux, or WSL.
 
 ---
 

@@ -419,6 +419,7 @@ CodeMachine supports the following AI engines:
 3. **cursor** - Cursor AI models
 4. **ccr** - Claude Code Router CLI (brings your locally configured providers)
 5. **opencode** - OpenCode CLI (provider-agnostic; supply `provider/model` strings such as `anthropic/claude-3.7-sonnet`)
+6. **kimi** - Kimi CLI (Moonshot) with print (default) and wire JSON-RPC modes; requires `KIMI_API_KEY`
 
 ### Engine Selection Strategy
 
@@ -443,6 +444,15 @@ steps: [
 ]
 ```
 
+### Runtime Engine Override
+
+Need to run everything on one engine without editing templates? Use either:
+
+- CLI flag: `codemachine start --engine opencode` or `codemachine run --engine kimi "frontend 'Ship it'"`
+- Environment variable (works for all commands): `CODEMACHINE_ENGINE_OVERRIDE=claude codemachine start`
+
+The override forces every workflow step (including modules, loops, and triggered agents) to use the selected engine, even if the workflow hard-codes another engine. Engine-specific subcommands (`codemachine codex run ...`) still default to their own engine, but you can override them with `--engine` as well.
+
 ### Model Options
 
 **Claude Models:**
@@ -460,6 +470,10 @@ steps: [
 
 **OpenCode Models:**
 - Provide the CLI-formatted `provider/model` name directly (e.g., `anthropic/claude-3.7-sonnet`, `openai/gpt-4.1`); CodeMachine passes the value through so you can mirror your OpenCode config.
+
+**Kimi Models:**
+- Pass the exact string you would give to `kimi -m`, such as `moonshot-v1-128k` or rely on `KIMI_MODEL_NAME`.
+- Use `CODEMACHINE_KIMI_MODE=wire` when you need the JSON-RPC wire UI for step/tool fidelity; omit it (default) for resilient print mode streaming.
 
 ### Reasoning Effort Levels
 

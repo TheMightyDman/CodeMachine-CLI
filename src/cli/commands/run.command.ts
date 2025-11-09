@@ -6,6 +6,7 @@ import chalk from 'chalk';
 type RunCommandOptions = {
   model?: string;
   dir: string;
+  engine?: string;
 };
 
 /**
@@ -21,6 +22,7 @@ export async function registerRunCommand(program: Command): Promise<void> {
     .command('run <script>')
     .description(`Run agent(s) with enhanced syntax using ${defaultEngineName}`)
     .option('--model <model>', 'Model to use (overrides agent config)')
+    .option('--engine <engine>', 'Engine ID to use for all agents (overrides defaults)')
     .option('-d, --dir <directory>', 'Working directory', process.cwd())
     .action(async (script: string, options: RunCommandOptions) => {
       // Set up cleanup handlers for graceful shutdown
@@ -46,12 +48,17 @@ export async function registerRunCommand(program: Command): Promise<void> {
  */
 async function runScript(script: string, options: RunCommandOptions): Promise<void> {
   const trimmed = script.trim();
+  const engineOverrideInput = options.engine ?? process.env.CODEMACHINE_ENGINE_OVERRIDE;
+  const engineOverride = typeof engineOverrideInput === 'string' && engineOverrideInput.trim()
+    ? engineOverrideInput.trim().toLowerCase()
+    : undefined;
 
   // CoordinatorService handles both single agents and coordination
   // No need for separate detection - the parser handles both syntaxes
   const coordinator = CoordinatorService.getInstance();
   await coordinator.execute(trimmed, {
-    workingDir: options.dir
+    workingDir: options.dir,
+    engineOverride,
   });
 }
 
@@ -73,15 +80,18 @@ async function registerEngineRunCommands(program: Command): Promise<void> {
       .description(`Run agent(s) with ${engine.metadata.name}`)
       .argument('<script>', 'Agent script to execute')
       .option('--model <model>', 'Model to use (overrides agent config)')
+      .option('--engine <engine>', 'Engine ID to use for all agents (overrides defaults)')
       .option('-d, --dir <directory>', 'Working directory', process.cwd())
       .action(async (script: string, options: RunCommandOptions) => {
         // Set up cleanup handlers for graceful shutdown
         MonitoringCleanup.setup();
 
         try {
-          // For engine-specific run, we need to pass the engine parameter
-          // This is a simplified version - full implementation would need engine parameter support
-          await runScript(script, options);
+          const overrideOptions: RunCommandOptions = {
+            ...options,
+            engine: options.engine ?? engine.metadata.id,
+          };
+          await runScript(script, overrideOptions);
           process.exit(0);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);

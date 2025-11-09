@@ -14,6 +14,7 @@ import {
   createSpinnerLoggers,
 } from '../../shared/logging/index.js';
 import { processPromptString } from '../../shared/prompts/index.js';
+import { runWithPermissionMediator } from '../../runtime/permissions/index.js';
 
 type StepCommandOptions = {
   model?: string;
@@ -149,19 +150,27 @@ async function executeStep(
 
   try {
     let totalStdout = '';
-    const result = await engine.run({
-      prompt: compositePrompt,
-      workingDir,
-      model,
-      modelReasoningEffort,
-      onData: (chunk) => {
-        totalStdout += chunk;
-        stdoutLogger(chunk);
+    const result = await runWithPermissionMediator(
+      (envOverride) =>
+        engine.run({
+          prompt: compositePrompt,
+          workingDir,
+          model,
+          modelReasoningEffort,
+          env: envOverride,
+          onData: (chunk) => {
+            totalStdout += chunk;
+            stdoutLogger(chunk);
+          },
+          onErrorData: (chunk) => {
+            stderrLogger(chunk);
+          },
+        }),
+      {
+        engine: engineType,
+        workingDir,
       },
-      onErrorData: (chunk) => {
-        stderrLogger(chunk);
-      },
-    });
+    );
 
     stopSpinner(spinnerState);
 
