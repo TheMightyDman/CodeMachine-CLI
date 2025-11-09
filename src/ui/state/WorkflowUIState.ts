@@ -111,6 +111,22 @@ export class WorkflowUIState {
     this.notifyListeners();
   }
 
+  updateAgentEngine(agentId: string, engine: EngineType): void {
+    this.state = {
+      ...this.state,
+      agents: this.state.agents.map((agent) =>
+        agent.id === agentId
+          ? {
+              ...agent,
+              engine,
+            }
+          : agent
+      ),
+    };
+
+    this.notifyListeners();
+  }
+
 
   updateAgentTelemetry(agentId: string, telemetry: Partial<AgentTelemetry>): void {
     this.state = {

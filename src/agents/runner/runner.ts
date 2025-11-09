@@ -8,6 +8,7 @@ import { loadAgentConfig } from './config.js';
 import { AgentMonitorService, AgentLoggerService } from '../monitoring/index.js';
 import type { ParsedTelemetry } from '../../infra/engines/core/types.js';
 import { formatForLogFile } from '../../shared/formatters/logFileFormatter.js';
+import { runWithPermissionMediator } from '../../runtime/permissions/index.js';
 
 /**
  * Cache for engine authentication status with TTL (shared across all subagents)
@@ -135,6 +136,19 @@ async function ensureEngineAuth(engineType: EngineType): Promise<void> {
     throw new Error(
       `Unknown engine type: ${engineType}. Available engines: ${availableEngines}`
     );
+  }
+
+  // Kimi relies solely on env vars and our tmp cache; proactively ensure auth
+  if (engine.metadata.id === 'kimi') {
+    try {
+      await engine.auth.ensureAuth();
+      return;
+    } catch (err) {
+      console.error(`\n${engine.metadata.name} authentication required`);
+      console.error(`\nRun the following command to authenticate:\n`);
+      console.error(`  codemachine auth login\n`);
+      throw err;
+    }
   }
 
   const isAuthed = await engine.auth.isAuthenticated();
@@ -269,20 +283,22 @@ export async function executeAgent(
   let totalStdout = '';
 
   try {
-    const result = await engine.run({
-      prompt, // Already complete and ready to use
-      workingDir,
-      model,
-      modelReasoningEffort,
-      env: {
-        ...process.env,
-        // Pass parent agent ID to child processes (for orchestration context)
-        ...(monitoringAgentId !== undefined && {
-          CODEMACHINE_PARENT_AGENT_ID: monitoringAgentId.toString()
-        })
-      },
-      onData: (chunk) => {
-        totalStdout += chunk;
+    const baseEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...(monitoringAgentId !== undefined && {
+        CODEMACHINE_PARENT_AGENT_ID: monitoringAgentId.toString()
+      })
+    };
+
+    const result = await runWithPermissionMediator(
+      (envOverride) => engine.run({
+        prompt, // Already complete and ready to use
+        workingDir,
+        model,
+        modelReasoningEffort,
+        env: envOverride ?? baseEnv,
+        onData: (chunk) => {
+          totalStdout += chunk;
 
         // Dual-stream: write to log file (with status text) AND original logger (with colors)
         if (loggerService && monitoringAgentId !== undefined) {
@@ -334,7 +350,13 @@ export async function executeAgent(
       },
       abortSignal,
       timeout,
-    });
+      }),
+      {
+        engine: engineType,
+        workingDir,
+        baseEnv,
+      },
+    );
 
     // Store output in memory
     const stdout = result.stdout || totalStdout;

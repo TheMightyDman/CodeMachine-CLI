@@ -1,4 +1,5 @@
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, stat, readdir, writeFile, mkdir } from 'node:fs/promises';
+import * as path from 'node:path';
 import { loadPlaceholdersConfig, resolvePlaceholderPath } from '../config/loader.js';
 import { loadPlaceholderContent } from '../content/loader.js';
 import { findPlaceholders, getUniquePlaceholderNames } from './parser.js';
@@ -152,6 +153,11 @@ async function replacePlaceholders(
       const content = await loadPlaceholderContentCached(baseDir, filePath);
       return { placeholderName, content, isOptional };
     } catch (error) {
+      // Try synthesizing well-known manifests before failing
+      const synthesized = await synthesizePlaceholderIfPossible(placeholderName, baseDir, filePath).catch(() => null);
+      if (synthesized !== null) {
+        return { placeholderName, content: synthesized, isOptional };
+      }
       // Handle error based on whether placeholder is optional
       const fallbackContent = handlePlaceholderLoadError(
         placeholderName,
@@ -177,6 +183,55 @@ async function replacePlaceholders(
   }
 
   return processedPrompt;
+}
+
+/**
+ * Attempts to synthesize placeholder content when expected files are missing.
+ * Currently supports:
+ *  - architecture_manifest_json: generates a manifest from markdown files in the architecture folder
+ */
+async function synthesizePlaceholderIfPossible(
+  placeholderName: string,
+  baseDir: string,
+  filePath: string,
+): Promise<string | null> {
+  if (placeholderName === 'architecture_manifest_json') {
+    // Derive directory from target file path
+    const dir = path.isAbsolute(filePath) ? path.dirname(filePath) : path.resolve(baseDir, path.dirname(filePath));
+    try {
+      await mkdir(dir, { recursive: true });
+      const entries = await readdir(dir, { withFileTypes: true });
+      const mdFiles = entries
+        .filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.md'))
+        .map((e) => path.join(dir, e.name))
+        .sort();
+
+      // If no markdowns found, give up
+      if (mdFiles.length === 0) {
+        return null;
+      }
+
+      // Produce a simple manifest schema
+      const manifest = {
+        version: 1,
+        generatedAt: new Date().toISOString(),
+        files: mdFiles.map((abs) => ({
+          path: abs,
+          name: path.basename(abs),
+        })),
+      };
+
+      const json = JSON.stringify(manifest, null, 2);
+
+      // Persist to the expected filePath for future runs
+      const absoluteTarget = path.isAbsolute(filePath) ? filePath : path.resolve(baseDir, filePath);
+      await writeFile(absoluteTarget, json, 'utf8').catch(() => {});
+      return json;
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 /**

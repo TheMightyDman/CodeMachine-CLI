@@ -59,6 +59,7 @@ export function resolveFolder(folderName: string, overrides: StepOverrides = {})
       promptPath: overrides.promptPath ?? promptPath,
       model,
       modelReasoningEffort: overrides.modelReasoningEffort ?? folderConfig.modelReasoningEffort,
+      engine: overrides.engine ?? folderConfig.engine,
     };
   });
 }

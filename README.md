@@ -108,6 +108,13 @@ CodeMachine requires at least one CLI-based AI engine to handle the primary role
     <td align="center" style="padding: 10px; font-size: 15px;">✅</td>
   </tr>
   <tr>
+    <td align="center" style="padding: 10px; font-size: 15px;"><strong>Kimi CLI</strong></td>
+    <td align="center" style="padding: 10px; font-size: 15px;">✅ Supported</td>
+    <td align="center" style="padding: 10px; font-size: 15px;">❌</td>
+    <td align="center" style="padding: 10px; font-size: 15px;">✅</td>
+    <td align="center" style="padding: 10px; font-size: 15px;">✅</td>
+  </tr>
+  <tr>
     <td align="center" style="padding: 10px; font-size: 15px;"><strong>Gemini CLI</strong></td>
     <td align="center" style="padding: 10px; font-size: 15px;">🚧 Coming Soon</td>
     <td align="center" style="padding: 10px; font-size: 15px;">✅</td>
@@ -134,9 +141,21 @@ OpenCode ships as a first-class engine. Install the CLI with `npm i -g opencode-
 - `codemachine opencode run "build hello world"` streams JSON-formatted OpenCode output through CodeMachine’s log markers.
 - Workflow steps can force OpenCode with `codemachine step <agent> --engine opencode --model anthropic/claude-3.7-sonnet`.
 - Guardrail environment defaults (overridable) are applied automatically:  
-  `OPENCODE_PERMISSION={"edit":"allow","webfetch":"allow","bash":{"*":"allow"}}`,  
+  `OPENCODE_PERMISSION={"*":"allow","bash":{"*":"allow"}}`,  
   `OPENCODE_DISABLE_LSP_DOWNLOAD=1`, `OPENCODE_DISABLE_DEFAULT_PLUGINS=1`, and `OPENCODE_CONFIG_DIR=$HOME/.codemachine/opencode`.
 - Set `CODEMACHINE_SKIP_OPENCODE=1` for dry-run workflows or `CODEMACHINE_PLAIN_LOGS=1` when you need ANSI-free logs.
+ - Important: Disable OpenCode sub‑agents. CodeMachine orchestrates sub‑agents itself and currently does not mediate OpenCode’s nested sub‑agent features. Leaving them on can cause OpenCode to disconnect, and it isn’t needed because CodeMachine already trims each task down for a single agent.
+
+### Kimi CLI Integration
+
+Kimi (Moonshot) now ships as a first-class engine with both print and wire modes:
+
+- **Install**: `uv tool install --python 3.13 kimi-cli`
+- **Authenticate**: export `KIMI_API_KEY` (plus optional `KIMI_BASE_URL` / `KIMI_MODEL_NAME`) **or** run `codemachine auth login`. CodeMachine stores the key at `<project>/.codemachine/kimi/auth.env` (0600) with a legacy tmp fallback. Override via `CODEMACHINE_KIMI_AUTH_FILE` and inspect state via `codemachine auth status`. When no overrides are set we default to `KIMI_BASE_URL=https://api.kimi.com/coding/v1` and `KIMI_MODEL_NAME=kimi-for-coding` so the CLI has a working provider even on fresh machines.
+- **Usage**: `codemachine kimi run "code-generator 'Build login page'"` or `--engine kimi --model moonshot-v1-128k`
+- **Modes**: Print mode (default) streams JSONL safely for CI; set `CODEMACHINE_KIMI_MODE=wire` to switch to the JSON-RPC wire server for full step/tool fidelity. Wire mode auto-approves CLI prompts so workflows stay non-interactive.
+- **MCP configs**: Provide comma-separated paths via `KIMI_MCP_CONFIG_FILES=/path/a.json,/path/b.json` to pass through to the CLI.
+- **Flags**: `CODEMACHINE_SKIP_KIMI=1` skips execution (dry-run), `CODEMACHINE_PLAIN_LOGS=1` strips ANSI. Windows is not yet supported—use macOS, Linux, or WSL.
 
 ---
 

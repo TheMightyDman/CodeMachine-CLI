@@ -13,6 +13,8 @@ export interface SpawnOptions {
   stdioMode?: 'pipe' | 'inherit';
   timeout?: number; // Timeout in milliseconds
   stdinInput?: string; // Data to write to stdin
+  keepStdinOpen?: boolean; // Keep stdin open for interactive protocols
+  onSpawn?: (child: ChildProcess) => void; // Callback invoked immediately after spawn
 }
 
 export interface SpawnResult {
@@ -51,9 +53,33 @@ export function killAllActiveProcesses(): void {
 }
 
 export function spawnProcess(options: SpawnOptions): Promise<SpawnResult> {
-  const { command, args = [], cwd, env, onStdout, onStderr, signal, stdioMode = 'pipe', timeout, stdinInput } = options;
+  const {
+    command,
+    args = [],
+    cwd,
+    env,
+    onStdout,
+    onStderr,
+    signal,
+    stdioMode = 'pipe',
+    timeout,
+    stdinInput,
+    keepStdinOpen = false,
+    onSpawn,
+  } = options;
 
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const resolveOnce = (value: SpawnResult) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const rejectOnce = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
     // Track if process was aborted to handle close event correctly
     let wasAborted = false;
 
@@ -64,11 +90,24 @@ export function spawnProcess(options: SpawnOptions): Promise<SpawnResult> {
       env: env ? { ...process.env, ...env } : process.env,
       stdio: stdioMode === 'inherit' ? ['ignore', 'inherit', 'inherit'] : ['pipe', 'pipe', 'pipe'],
       signal,
-      timeout,
       // Spawn in new process group on Unix to enable killing all children together
       // This is critical for Node.js wrapper scripts (like CCR) that spawn subprocesses
       ...(process.platform !== 'win32' ? { detached: true } : {}),
     });
+
+    const closeChildStdin = () => {
+      if (child.stdin && !child.stdin.destroyed) {
+        try {
+          child.stdin.end();
+        } catch {
+          try {
+            child.stdin.destroy();
+          } catch {
+            // Ignore errors during stdin cleanup
+          }
+        }
+      }
+    };
 
     // Track this child process for cleanup
     activeProcesses.add(child);
@@ -77,6 +116,40 @@ export function spawnProcess(options: SpawnOptions): Promise<SpawnResult> {
     const removeFromTracking = () => {
       activeProcesses.delete(child);
     };
+
+    onSpawn?.(child);
+
+    let timeoutId: NodeJS.Timeout | null = null;
+    let timedOut = false;
+    let timeoutError: Error | null = null;
+
+    const clearTimeoutIfNeeded = () => {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+    };
+
+    if (typeof timeout === 'number' && timeout > 0) {
+      timeoutId = setTimeout(() => {
+        if (child.killed) {
+          return;
+        }
+        timedOut = true;
+        timeoutError = new Error(`Process timed out after ${timeout}ms`);
+        timeoutError.name = 'TimeoutError';
+        try {
+          child.kill('SIGTERM');
+          setTimeout(() => {
+            if (!child.killed) {
+              child.kill('SIGKILL');
+            }
+          }, 1000);
+        } catch {
+          // ignore kill errors
+        }
+      }, timeout);
+    }
 
     // Handle abort signal explicitly (in case cross-spawn doesn't handle it properly)
     if (signal) {
@@ -128,6 +201,7 @@ export function spawnProcess(options: SpawnOptions): Promise<SpawnResult> {
         } else {
           logger.debug(`Process ${command} already killed, skipping manual kill`);
         }
+        closeChildStdin();
       };
 
       // Check if already aborted before adding listener
@@ -141,8 +215,16 @@ export function spawnProcess(options: SpawnOptions): Promise<SpawnResult> {
     // Write to stdin if data is provided
     if (child.stdin) {
       if (stdinInput !== undefined) {
-        child.stdin.end(stdinInput);
-      } else if (stdioMode === 'pipe') {
+        if (keepStdinOpen) {
+          try {
+            child.stdin.write(stdinInput);
+          } catch {
+            // Ignore write errors; process likely exited
+          }
+        } else {
+          child.stdin.end(stdinInput);
+        }
+      } else if (!keepStdinOpen && stdioMode === 'pipe') {
         child.stdin.end();
       }
     }
@@ -177,24 +259,31 @@ export function spawnProcess(options: SpawnOptions): Promise<SpawnResult> {
 
       logger.debug(`Process error event for ${command}: ${error.message}`);
       removeFromTracking();
-      reject(error);
+      closeChildStdin();
+      clearTimeoutIfNeeded();
+      rejectOnce(error);
     });
 
     child.once('close', (code: number | null) => {
       logger.debug(`Process close event for ${command} (PID: ${child.pid}), code: ${code}, wasAborted: ${wasAborted}`);
       removeFromTracking();
+      closeChildStdin();
+      clearTimeoutIfNeeded();
 
       // If process was aborted, reject the promise instead of resolving
       if (wasAborted) {
-        // Reject with the abort reason (which is an AbortError DOMException)
-        // This ensures the error name is 'AbortError' and will be caught correctly by the workflow
         logger.debug(`Process ${command} was aborted, rejecting with AbortError`);
-        reject(signal?.reason || new Error('Process aborted'));
+        rejectOnce((signal as any)?.reason || new Error('Process aborted'));
+        return;
+      }
+
+      if (timedOut && timeoutError) {
+        rejectOnce(timeoutError);
         return;
       }
 
       const exitCode = code ?? 0;
-      resolve({
+      resolveOnce({
         exitCode,
         stdout: stdoutChunks.join(''),
         stderr: stderrChunks.join(''),

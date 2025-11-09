@@ -9,6 +9,7 @@ const DEFAULT_SPEC_PATH = '.codemachine/inputs/specifications.md';
 
 type StartCommandOptions = {
   spec?: string;
+  engine?: string;
 };
 
 export function registerStartCommand(program: Command): void {
@@ -16,6 +17,7 @@ export function registerStartCommand(program: Command): void {
     .command('start')
     .description('Run the workflow queue until completion (non-interactive)')
     .option('--spec <path>', 'Path to the planning specification file')
+    .option('--engine <engine>', 'Force a specific engine for all workflow steps')
     .action(async (options: StartCommandOptions, command: Command) => {
       const cwd = process.env.CODEMACHINE_CWD || process.cwd();
 
@@ -23,6 +25,7 @@ export function registerStartCommand(program: Command): void {
       const globalOpts = command.optsWithGlobals ? command.optsWithGlobals() : command.opts();
       const specPath = options.spec ?? globalOpts.spec ?? DEFAULT_SPEC_PATH;
       const specificationPath = path.resolve(cwd, specPath);
+      const engineOverride = options.engine ?? globalOpts.engine;
 
       debug(`Starting workflow (spec: ${specificationPath})`);
 
@@ -30,7 +33,7 @@ export function registerStartCommand(program: Command): void {
       clearTerminal();
 
       try {
-        await runWorkflowQueue({ cwd, specificationPath });
+        await runWorkflowQueue({ cwd, specificationPath, engineOverride });
         console.log('\n✓ Workflow completed successfully');
         process.exit(0);
       } catch (error) {

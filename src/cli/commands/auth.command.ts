@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import { homedir } from 'node:os';
 import { execa } from 'execa';
 import prompts from 'prompts';
+import type { KimiAuthDiagnostics } from '../../infra/engines/providers/kimi/auth.js';
 import { registry } from '../../infra/engines/index.js';
 import { selectFromMenu, type SelectionChoice } from '../presentation/selection-menu.js';
 import { expandHomeDir } from '../../shared/utils/index.js';
@@ -27,6 +28,43 @@ async function selectAuthProvider(): Promise<string | undefined> {
   });
 }
 
+function formatYesNo(value: boolean): string {
+  return value ? 'yes' : 'no';
+}
+
+async function getKimiDiagnostics(): Promise<KimiAuthDiagnostics> {
+  const { getAuthDiagnostics } = await import('../../infra/engines/providers/kimi/auth.js');
+  return await getAuthDiagnostics();
+}
+
+function printKimiStatus(diag: KimiAuthDiagnostics, heading: string): void {
+  console.log(`\n────────────────────────────────────────────────────────────`);
+  console.log(`  ${heading}`);
+  console.log(`────────────────────────────────────────────────────────────`);
+  console.log(`\nPlatform: ${diag.isWindows ? 'Windows (unsupported for Kimi CLI)' : 'macOS/Linux'}`);
+  console.log(`CLI installed: ${formatYesNo(diag.cliInstalled)}`);
+  console.log(`Inline env (current process): ${formatYesNo(diag.inlineKey)}`);
+  console.log(`Project root: ${diag.projectRoot}`);
+  if (diag.overridePath) {
+    console.log(`Override file: ${diag.overridePath}`);
+  }
+  console.log(`Primary auth file: ${diag.primaryAuthPath}`);
+  console.log(`Legacy tmp file: ${diag.legacyTmpPath}`);
+  console.log(`\nAuth sources (highest priority first):`);
+  diag.sources.forEach((source, index) => {
+    const label = `${index + 1}) ${source.source.toUpperCase()}`;
+    const meta = [`exists=${formatYesNo(source.exists)}`, `key=${formatYesNo(source.hasKey)}`];
+    if (source.mode) {
+      meta.push(`perms=${source.mode}`);
+    }
+    console.log(`  ${label}`);
+    console.log(`     path: ${source.path}`);
+    console.log(`     ${meta.join(', ')}`);
+  });
+  console.log(`\nUse \`codemachine auth status\` or \`codemachine auth logout\` to manage these files.`);
+  console.log(`────────────────────────────────────────────────────────────\n`);
+}
+
 async function handleLogin(providerId: string): Promise<void> {
   const engine = registry.get(providerId);
   if (!engine) {
@@ -34,7 +72,7 @@ async function handleLogin(providerId: string): Promise<void> {
   }
 
   const action = await engine.auth.nextAuthMenuAction();
-  if (action === 'logout') {
+  if (action === 'logout' && providerId !== 'kimi') {
     // Special handling for CCR - show configuration tip instead of generic message
     if (providerId === 'ccr') {
       console.log(`\n────────────────────────────────────────────────────────────`);
@@ -107,11 +145,18 @@ async function handleLogin(providerId: string): Promise<void> {
     } else {
       console.log(`Already authenticated with ${engine.metadata.name}. Use \`codemachine auth logout\` to sign out.`);
     }
-    return;
   }
 
-  await engine.auth.ensureAuth();
-  console.log(`${engine.metadata.name} authentication successful.`);
+  if (providerId === 'kimi') {
+    // Ensure we actually capture a key and populate the auth file during login.
+    delete (process.env as Record<string, string | undefined>).KIMI_API_KEY;
+    await engine.auth.ensureAuth();
+    const diag = await getKimiDiagnostics();
+    printKimiStatus(diag, `✅  ${engine.metadata.name} Ready`);
+  } else {
+    await engine.auth.ensureAuth();
+    console.log(`${engine.metadata.name} authentication successful.`);
+  }
 }
 
 async function handleLogout(providerId: string): Promise<void> {
@@ -122,6 +167,29 @@ async function handleLogout(providerId: string): Promise<void> {
 
   await engine.auth.clearAuth();
   console.log(`Signed out from ${engine.metadata.name}. Next action will be \`login\`.`);
+}
+
+async function handleStatus(providerId: string): Promise<void> {
+  const engine = registry.get(providerId);
+  if (!engine) {
+    throw new Error(`Unknown provider: ${providerId}`);
+  }
+
+  if (providerId === 'kimi') {
+    const diag = await getKimiDiagnostics();
+    const heading = diag.inlineKey || diag.sources.some(source => source.hasKey)
+      ? `✅  ${engine.metadata.name} Authentication Status`
+      : `⚠️  ${engine.metadata.name} Authentication Status`;
+    printKimiStatus(diag, heading);
+    return;
+  }
+
+  const authed = await engine.auth.isAuthenticated();
+  if (authed) {
+    console.log(`✅  ${engine.metadata.name} is authenticated.`);
+  } else {
+    console.log(`⚠️  ${engine.metadata.name} is not authenticated. Run \`codemachine auth login\`.`);
+  }
 }
 
 export function registerAuthCommands(program: Command): void {
@@ -151,5 +219,17 @@ export function registerAuthCommands(program: Command): void {
         return;
       }
       await handleLogout(provider);
+    });
+
+  authCommand
+    .command('status')
+    .description('Show authentication status')
+    .action(async () => {
+      const provider = await selectAuthProvider();
+      if (!provider) {
+        console.log('No provider selected.');
+        return;
+      }
+      await handleStatus(provider);
     });
 }

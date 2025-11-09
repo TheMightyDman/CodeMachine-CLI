@@ -56,6 +56,8 @@ export function resolveModule(id: string, overrides: ModuleOverrides = {}): Work
     promptPath,
     model,
     modelReasoningEffort,
+    // Allow engine override at callsite (e.g., resolveModule('id', { engine: 'opencode' }))
+    engine: overrides.engine ?? moduleEntry.engine,
     module: {
       id: moduleEntry.id,
       behavior,

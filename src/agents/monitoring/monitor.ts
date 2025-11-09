@@ -10,6 +10,8 @@ import * as logger from '../../shared/logging/logger.js';
 export class AgentMonitorService {
   private static instance: AgentMonitorService;
   private registry: AgentRegistry;
+  private telemetryBuffer: Map<number, { telemetry: ParsedTelemetry; timeout: NodeJS.Timeout }> = new Map();
+  private telemetryDebounceMs = 300;
 
   private constructor() {
     this.registry = new AgentRegistry();
@@ -76,6 +78,7 @@ export class AgentMonitorService {
    * Mark agent as completed
    */
   async complete(id: number, telemetry?: ParsedTelemetry): Promise<void> {
+    await this.flushBufferedTelemetry(id);
     const agent = this.registry.get(id);
     if (!agent) {
       logger.warn(`Attempted to complete non-existent agent ${id}`);
@@ -105,6 +108,7 @@ export class AgentMonitorService {
    * Mark agent as failed
    */
   async fail(id: number, error: Error | string): Promise<void> {
+    await this.flushBufferedTelemetry(id);
     const agent = this.registry.get(id);
     if (!agent) {
       logger.warn(`Attempted to fail non-existent agent ${id}`);
@@ -145,7 +149,7 @@ export class AgentMonitorService {
    * Update agent telemetry
    */
   async updateTelemetry(id: number, telemetry: ParsedTelemetry): Promise<void> {
-    await this.registry.update(id, { telemetry });
+    this.bufferTelemetry(id, telemetry);
   }
 
   /**
@@ -367,6 +371,33 @@ export class AgentMonitorService {
   private getDefaultLogPath(id: number, name: string, startTime: string): string {
     const timestamp = new Date(startTime).toISOString().replace(/:/g, '-').replace(/\..+/, '');
     return `.codemachine/logs/agent-${id}-${name}-${timestamp}.log`;
+  }
+
+  private bufferTelemetry(id: number, telemetry: ParsedTelemetry): void {
+    const existing = this.telemetryBuffer.get(id);
+    if (existing) {
+      existing.telemetry = telemetry;
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      this.flushBufferedTelemetry(id).catch(err => {
+        logger.warn(`Failed to flush telemetry for agent ${id}: ${err}`);
+      });
+    }, this.telemetryDebounceMs);
+
+    this.telemetryBuffer.set(id, { telemetry, timeout });
+  }
+
+  private async flushBufferedTelemetry(id: number): Promise<void> {
+    const entry = this.telemetryBuffer.get(id);
+    if (!entry) {
+      return;
+    }
+
+    clearTimeout(entry.timeout);
+    this.telemetryBuffer.delete(id);
+    await this.registry.update(id, { telemetry: entry.telemetry });
   }
 }
 

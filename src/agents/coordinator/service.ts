@@ -4,6 +4,7 @@ import type { CoordinationResult } from './types.js';
 import { AgentMonitorService } from '../monitoring/index.js';
 import * as logger from '../../shared/logging/logger.js';
 import chalk from 'chalk';
+import type { EngineType } from '../../infra/engines/index.js';
 
 export interface CoordinatorOptions {
   /** Working directory for agent execution */
@@ -11,6 +12,9 @@ export interface CoordinatorOptions {
 
   /** Optional logger for agent output */
   logger?: (agentName: string, chunk: string) => void;
+
+  /** Optional engine override to apply to every coordinated agent */
+  engineOverride?: EngineType;
 }
 
 /**
@@ -93,7 +97,8 @@ export class CoordinatorService {
     const executor = new CoordinationExecutor({
       workingDir: options.workingDir,
       parentId: contextParentId, // Agents register directly under workflow agent
-      logger: options.logger
+      logger: options.logger,
+      engineOverride: options.engineOverride,
     });
 
     // Execute the plan

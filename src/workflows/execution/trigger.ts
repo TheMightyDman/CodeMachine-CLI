@@ -8,6 +8,7 @@ import { formatAgentLog } from '../../shared/logging/index.js';
 import { processPromptString } from '../../shared/prompts/index.js';
 import type { WorkflowUIManager } from '../../ui/index.js';
 import { AgentMonitorService, AgentLoggerService } from '../../agents/monitoring/index.js';
+import { runWithPermissionMediator } from '../../runtime/permissions/index.js';
 
 export interface TriggerExecutionOptions {
   triggerAgentId: string;
@@ -100,37 +101,45 @@ export async function executeTriggerAgent(options: TriggerExecutionOptions): Pro
 
     // Execute triggered agent
     let totalTriggeredStdout = '';
-    const triggeredResult = await engine.run({
-      prompt: compositePrompt,
-      workingDir: cwd,
-      model: triggeredModel,
-      modelReasoningEffort: triggeredReasoning,
-      onData: (chunk) => {
-        totalTriggeredStdout += chunk;
+    const triggeredResult = await runWithPermissionMediator(
+      (envOverride) =>
+        engine.run({
+          prompt: compositePrompt,
+          workingDir: cwd,
+          model: triggeredModel,
+          modelReasoningEffort: triggeredReasoning,
+          env: envOverride,
+          onData: (chunk) => {
+            totalTriggeredStdout += chunk;
 
-        // Write to log file only (UI reads from log file)
-        if (loggerService && monitoringAgentId !== undefined) {
-          loggerService.write(monitoringAgentId, chunk);
-        }
-      },
-      onErrorData: (chunk) => {
-        // Write stderr to log file only (UI reads from log file)
-        if (loggerService && monitoringAgentId !== undefined) {
-          loggerService.write(monitoringAgentId, `[STDERR] ${chunk}`);
-        }
-      },
-      onTelemetry: (telemetry) => {
-        ui?.updateAgentTelemetry(triggerAgentId, telemetry);
+            // Write to log file only (UI reads from log file)
+            if (loggerService && monitoringAgentId !== undefined) {
+              loggerService.write(monitoringAgentId, chunk);
+            }
+          },
+          onErrorData: (chunk) => {
+            // Write stderr to log file only (UI reads from log file)
+            if (loggerService && monitoringAgentId !== undefined) {
+              loggerService.write(monitoringAgentId, `[STDERR] ${chunk}`);
+            }
+          },
+          onTelemetry: (telemetry) => {
+            ui?.updateAgentTelemetry(triggerAgentId, telemetry);
 
-        // Update telemetry in monitoring (fire and forget - don't block streaming)
-        if (monitor && monitoringAgentId !== undefined) {
-          monitor.updateTelemetry(monitoringAgentId, telemetry).catch(err =>
-            console.error(`Failed to update telemetry: ${err}`)
-          );
-        }
+            // Update telemetry in monitoring (fire and forget - don't block streaming)
+            if (monitor && monitoringAgentId !== undefined) {
+              monitor.updateTelemetry(monitoringAgentId, telemetry).catch(err =>
+                console.error(`Failed to update telemetry: ${err}`)
+              );
+            }
+          },
+          abortSignal,
+        }),
+      {
+        engine: engineType,
+        workingDir: cwd,
       },
-      abortSignal,
-    });
+    );
 
     // NOTE: Telemetry is already updated via onTelemetry callback during streaming execution.
     // DO NOT parse from final output - it would match the FIRST telemetry line (early/wrong values)

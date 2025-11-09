@@ -1,6 +1,6 @@
-import lockfile from 'proper-lockfile';
 import { existsSync } from 'fs';
 import * as logger from '../../shared/logging/logger.js';
+import { acquireFileLock, LockBusyError, cleanupStaleLock } from '../../shared/fs/fileLock.js';
 
 /**
  * Service for managing file system locks on log files
@@ -22,14 +22,13 @@ export class LogLockService {
         return async () => {};
       }
 
-      // Acquire lock with proper-lockfile
-      const release = await lockfile.lock(filePath, {
-        stale: 30000, // 30 second stale timeout to prevent deadlocks
-        retries: {
-          retries: 3,
-          minTimeout: 100,
-          maxTimeout: 500,
-        },
+      const lockPath = `${filePath}.lock`;
+      await cleanupStaleLock(lockPath).catch(() => {});
+      const release = await acquireFileLock(lockPath, {
+        staleMs: 30_000,
+        retries: 3,
+        retryDelayMs: 120,
+        description: `log:${filePath}`,
       });
 
       // Store release function
@@ -38,7 +37,11 @@ export class LogLockService {
 
       return release;
     } catch (error) {
-      logger.debug(`Failed to acquire lock for ${filePath}: ${error}`);
+      if (error instanceof LockBusyError) {
+        logger.debug(`Log lock busy for ${filePath}, continuing without exclusive lock`);
+      } else {
+        logger.debug(`Failed to acquire lock for ${filePath}: ${error}`);
+      }
       // Return no-op release function for graceful degradation
       // This allows the system to continue even if locking fails
       return async () => {};

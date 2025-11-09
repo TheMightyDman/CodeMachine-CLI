@@ -273,17 +273,33 @@ export class AgentRegistry {
    * Uses file locking to prevent multi-process conflicts
    */
   async update(id: number, updates: Partial<AgentRecord>): Promise<void> {
-    await this.lockService.withLock(async () => {
-      // Reload from disk to get latest state (critical for multi-process safety)
-      // This prevents subprocess changes (e.g., children array updates) from being lost
-      this.data = this.load();
+    try {
+      await this.lockService.withLock(async () => {
+        // Reload from disk to get latest state (critical for multi-process safety)
+        // This prevents subprocess changes (e.g., children array updates) from being lost
+        this.data = this.load();
 
-      const agent = this.data.agents[id];
-      if (agent) {
-        this.data.agents[id] = { ...agent, ...updates };
-        await this.persistImmediateAtomic();
+        const agent = this.data.agents[id];
+        if (agent) {
+          this.data.agents[id] = { ...agent, ...updates };
+          await this.persistImmediateAtomic();
+        }
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // If another process holds the lock, fall back to best-effort debounced write.
+      // Telemetry/status updates are non-critical; prefer continuity over failure.
+      if (message.includes('Lock file is already being held') || (error as { code?: string } | undefined)?.code === 'ELOCKED') {
+        logger.warn(`Registry update fallback (no lock): ${message}`);
+        const agent = this.data.agents[id];
+        if (agent) {
+          this.data.agents[id] = { ...agent, ...updates };
+          this.persist();
+        }
+        return;
       }
-    });
+      throw error;
+    }
   }
 
   /**

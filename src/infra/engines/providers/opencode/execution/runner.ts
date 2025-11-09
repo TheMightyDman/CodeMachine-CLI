@@ -1,4 +1,5 @@
 import * as path from 'node:path';
+import type { ChildProcess } from 'node:child_process';
 
 import { spawnProcess } from '../../../../process/spawn.js';
 import { buildOpenCodeRunCommand } from './commands.js';
@@ -8,6 +9,7 @@ import { formatCommand, formatResult, formatStatus, formatMessage } from '../../
 import { logger } from '../../../../../shared/logging/index.js';
 import { createTelemetryCapture } from '../../../../../shared/telemetry/index.js';
 import type { ParsedTelemetry } from '../../../core/types.js';
+import { PermissionRequiredError } from '../../../errors.js';
 
 export interface RunOpenCodeOptions {
   prompt: string;
@@ -28,7 +30,64 @@ export interface RunOpenCodeResult {
 }
 
 const ANSI_ESCAPE_SEQUENCE = new RegExp(String.raw`\u001B\[[0-9;?]*[ -/]*[@-~]`, 'g');
-const DEFAULT_PERMISSION_POLICY = '{"edit":"allow","webfetch":"allow","bash":{"*":"allow"}}';
+// Allow all categories by default to avoid interactive prompts in CI/non-interactive
+// Includes bash wildcard to preserve previous behavior
+const DEFAULT_PERMISSION_POLICY = '{"*":"allow","bash":{"*":"allow"}}';
+const PARAGRAPH_SEPARATOR_PATTERN = /\n{2,}/;
+
+interface ToolState {
+  output?: unknown;
+  title?: string;
+  input?: Record<string, unknown>;
+}
+
+interface ToolPart {
+  tool?: string;
+  state?: ToolState;
+}
+
+interface StepTokens {
+  input?: number;
+  output?: number;
+  cache?: {
+    read?: number;
+    write?: number;
+  };
+}
+
+interface StepPart {
+  reason?: string;
+  tokens?: StepTokens;
+  cost?: number;
+}
+
+interface ErrorPart {
+  data?: {
+    message?: string;
+  };
+  message?: string;
+  name?: string;
+}
+
+interface TextPart {
+  text?: string;
+}
+
+type OpenCodeEvent = {
+  type?: string;
+  part?: ToolPart | StepPart | TextPart | ErrorPart;
+  error?: ErrorPart;
+  properties?: Record<string, unknown>;
+  permission?: Record<string, unknown>;
+} & Record<string, unknown>;
+
+interface PermissionPayload {
+  id?: string;
+  type?: string;
+  pattern?: string | string[];
+  title?: string;
+  metadata?: Record<string, unknown>;
+}
 
 function shouldApplyDefault(key: string, overrides?: NodeJS.ProcessEnv): boolean {
   return overrides?.[key] === undefined && process.env[key] === undefined;
@@ -41,6 +100,7 @@ function resolveRunnerEnv(env?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     runnerEnv.OPENCODE_PERMISSION = DEFAULT_PERMISSION_POLICY;
   }
 
+  // Reduce bootstrapping overhead and interactivity from plugins/LSPs
   if (shouldApplyDefault('OPENCODE_DISABLE_LSP_DOWNLOAD', env)) {
     runnerEnv.OPENCODE_DISABLE_LSP_DOWNLOAD = '1';
   }
@@ -68,6 +128,63 @@ function resolveRunnerEnv(env?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return runnerEnv;
 }
 
+const asRecord = (value: unknown): Record<string, unknown> | undefined => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  return value as Record<string, unknown>;
+};
+
+const asString = (value: unknown): string | undefined => (typeof value === 'string' ? value : undefined);
+
+const toStringArray = (value: unknown): string[] | undefined => {
+  if (typeof value === 'string') {
+    return [value];
+  }
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === 'string');
+  }
+  return undefined;
+};
+
+function isPermissionPending(payload: PermissionPayload | undefined): boolean {
+  if (!payload) return false;
+  const statusSource =
+    asString(payload.metadata?.status) ??
+    asString(payload.metadata?.state) ??
+    asString(payload.metadata?.resolution) ??
+    '';
+  if (!statusSource) return true;
+  const normalized = statusSource.toLowerCase();
+  if (['approved', 'allow', 'allowed', 'granted', 'denied', 'rejected', 'resolved', 'dismissed'].includes(normalized)) {
+    return false;
+  }
+  return true;
+}
+
+function extractPermission(event: OpenCodeEvent): PermissionPayload | undefined {
+  if (event.permission && typeof event.permission === 'object') {
+    return {
+      ...(event.permission as PermissionPayload),
+      metadata: asRecord((event.permission as PermissionPayload).metadata),
+    };
+  }
+
+  const fromProps = asRecord(event.properties);
+  if (fromProps && (fromProps.title || fromProps.id || fromProps.type)) {
+    const payload: PermissionPayload = {
+      id: asString(fromProps.id),
+      type: asString(fromProps.type),
+      pattern: fromProps.pattern as PermissionPayload['pattern'],
+      title: asString(fromProps.title),
+      metadata: asRecord(fromProps.metadata ?? fromProps),
+    };
+    return payload;
+  }
+
+  return undefined;
+}
+
 const truncate = (value: string, length = 100): string =>
   value.length > length ? `${value.slice(0, length)}...` : value;
 
@@ -76,12 +193,71 @@ function cleanAnsi(text: string, plainLogs: boolean): string {
   return text.replace(ANSI_ESCAPE_SEQUENCE, '');
 }
 
-function formatToolUse(part: unknown, plainLogs: boolean): string {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const partObj = (typeof part === 'object' && part !== null ? part : {}) as Record<string, any>;
-  const tool = partObj?.tool ?? 'tool';
+function computeTextDelta(previous: string, nextValue: string): { delta: string; snapshot: string } {
+  if (!previous) {
+    return { delta: nextValue, snapshot: nextValue };
+  }
+
+  if (nextValue === previous) {
+    return { delta: '', snapshot: previous };
+  }
+
+  if (nextValue.startsWith(previous)) {
+    return { delta: nextValue.slice(previous.length), snapshot: nextValue };
+  }
+
+  return { delta: nextValue, snapshot: nextValue };
+}
+
+function removeDuplicateParagraphs(text: string, lastParagraph: { value: string }): string {
+  if (!text) {
+    return text;
+  }
+
+  const segments = text.split(/(\n{2,})/);
+  if (segments.length === 1) {
+    const normalized = segments[0]?.trim() ?? '';
+    if (normalized && normalized === lastParagraph.value) {
+      return '';
+    }
+    if (normalized) {
+      lastParagraph.value = normalized;
+    }
+    return text;
+  }
+
+  let output = '';
+  for (let i = 0; i < segments.length; i += 1) {
+    const segment = segments[i] ?? '';
+    if (i % 2 === 1) {
+      output += segment;
+      continue;
+    }
+
+    const normalized = segment.trim();
+    if (!normalized) {
+      output += segment;
+      continue;
+    }
+
+    if (normalized === lastParagraph.value) {
+      if (i + 1 < segments.length && PARAGRAPH_SEPARATOR_PATTERN.test(segments[i + 1] ?? '')) {
+        i += 1;
+      }
+      continue;
+    }
+
+    lastParagraph.value = normalized;
+    output += segment;
+  }
+
+  return output;
+}
+
+function formatToolUse(part: ToolPart | undefined, plainLogs: boolean): string {
+  const tool = part?.tool ?? 'tool';
   const base = formatCommand(tool, 'success');
-  const state = partObj?.state ?? {};
+  const state = part?.state ?? {};
 
   if (tool === 'bash') {
     const outputRaw =
@@ -110,42 +286,46 @@ function formatToolUse(part: unknown, plainLogs: boolean): string {
   return base;
 }
 
-function formatStepEvent(type: string, part: unknown): string | null {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const partObj = (typeof part === 'object' && part !== null ? part : {}) as Record<string, any>;
-  const reason = typeof partObj?.reason === 'string' ? partObj.reason : undefined;
-
-  // Only show final step (reason: 'stop'), skip intermediate steps (reason: 'tool-calls')
-  if (reason !== 'stop') {
-    return null;
+function formatStepEvent(type: string, part: StepPart | undefined): string {
+  if (type === 'step_start') {
+    return formatStatus('OpenCode started a new step');
   }
 
-  const tokens = partObj?.tokens;
-  if (!tokens) {
-    return null;
-  }
+  const reason = typeof part?.reason === 'string' ? part.reason : undefined;
+  const tokens = part?.tokens;
+  const cache = tokens ? (tokens.cache?.read ?? 0) + (tokens.cache?.write ?? 0) : 0;
+  const tokenSummary = tokens
+    ? `Tokens ${tokens.input ?? 0}in/${tokens.output ?? 0}out${cache > 0 ? ` (${cache} cached)` : ''}`
+    : undefined;
 
-  const cache = (tokens.cache?.read ?? 0) + (tokens.cache?.write ?? 0);
-  const totalIn = (tokens.input ?? 0) + cache;
-  const tokenSummary = `⏱️  Tokens: ${totalIn}in/${tokens.output ?? 0}out${cache > 0 ? ` (${cache} cached)` : ''}`;
+  const segments = ['OpenCode finished a step'];
+  if (reason) segments.push(`Reason: ${reason}`);
+  if (tokenSummary) segments.push(tokenSummary);
 
-  return tokenSummary;
+  return formatStatus(segments.join(' | '));
 }
 
-function formatErrorEvent(error: unknown, plainLogs: boolean): string {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const errorObj = (typeof error === 'object' && error !== null ? error : {}) as Record<string, any>;
+function formatErrorEvent(error: ErrorPart | undefined, plainLogs: boolean): string {
   const dataMessage =
-    typeof errorObj?.data?.message === 'string'
-      ? errorObj.data.message
-      : typeof errorObj?.message === 'string'
-        ? errorObj.message
-        : typeof errorObj?.name === 'string'
-          ? errorObj.name
+    typeof error?.data?.message === 'string'
+      ? error.data.message
+      : typeof error?.message === 'string'
+        ? error.message
+        : typeof error?.name === 'string'
+          ? error.name
           : 'OpenCode reported an unknown error';
 
   const cleaned = cleanAnsi(dataMessage, plainLogs);
   return `${formatCommand('OpenCode Error', 'error')}\n${formatResult(cleaned, true)}`;
+}
+
+function resolveTimeoutMs(passed?: number): number {
+  if (typeof passed === 'number' && passed > 0) return passed;
+  const override = process.env.CODEMACHINE_OPENCODE_TIMEOUT_MS;
+  const parsed = override ? Number(override) : NaN;
+  if (!Number.isNaN(parsed) && parsed > 0) return parsed;
+  // Default to 5 minutes instead of 30 to fail fast when providers hang
+  return 300_000;
 }
 
 export async function runOpenCode(options: RunOpenCodeOptions): Promise<RunOpenCodeResult> {
@@ -159,7 +339,7 @@ export async function runOpenCode(options: RunOpenCodeOptions): Promise<RunOpenC
     onErrorData,
     onTelemetry,
     abortSignal,
-    timeout = 1800000,
+    timeout,
   } = options;
 
   if (!prompt) {
@@ -175,25 +355,72 @@ export async function runOpenCode(options: RunOpenCodeOptions): Promise<RunOpenC
     (env?.CODEMACHINE_PLAIN_LOGS ?? process.env.CODEMACHINE_PLAIN_LOGS ?? '').toString() === '1';
   const { command, args } = buildOpenCodeRunCommand({ model, agent });
 
+  try {
+    onData?.(formatStatus('OpenCode is analyzing your request...') + '\n');
+  } catch {
+    // ignore logging failures
+  }
+
   logger.debug(
     `OpenCode runner - prompt length: ${prompt.length}, lines: ${prompt.split('\n').length}, agent: ${
       agent ?? 'build'
     }, model: ${model ?? 'default'}`,
   );
+  logger.debug(
+    `OpenCode env: PERMISSION=${runnerEnv.OPENCODE_PERMISSION ? 'set' : 'unset'} CONFIG_DIR=${runnerEnv.OPENCODE_CONFIG_DIR ?? 'unset'} DISABLE_LSP=${runnerEnv.OPENCODE_DISABLE_LSP_DOWNLOAD ?? 'unset'} DISABLE_PLUGINS=${runnerEnv.OPENCODE_DISABLE_DEFAULT_PLUGINS ?? 'unset'}`,
+  );
 
   const telemetryCapture = createTelemetryCapture('opencode', model, prompt, workingDir);
+  let pendingPermissionError: PermissionRequiredError | null = null;
+  let capturedChild: ChildProcess | null = null;
   let jsonBuffer = '';
-  let isFirstStep = true;
+  let lastTextSnapshot = '';
+  const lastParagraph = { value: '' };
+  const effectiveTimeout = resolveTimeoutMs(timeout);
+  let lastActivity = Date.now();
+  let heartbeat: NodeJS.Timeout | null = null;
+  const shouldTailDiagnostics = (process.env.CODEMACHINE_OPENCODE_TAIL_ON_STALL === '1') || (process.env.LOG_LEVEL === 'debug');
+  let diagNotified = false;
+
+  async function getLatestOpenCodeLogPath(): Promise<string | null> {
+    try {
+      const base = process.env.XDG_DATA_HOME
+        ? require('node:path').resolve(require('node:os').homedir(), process.env.XDG_DATA_HOME)
+        : require('node:path').join(require('node:os').homedir(), '.local', 'share');
+      const logDir = require('node:path').join(base, 'opencode', 'log');
+      const { readdir, stat } = await import('node:fs/promises');
+      const entries = await readdir(logDir);
+      const candidates: Array<{ path: string; mtime: number }> = [];
+      for (const name of entries) {
+        if (!name.endsWith('.log')) continue;
+        const full = require('node:path').join(logDir, name);
+        try {
+          const s = await stat(full);
+          candidates.push({ path: full, mtime: s.mtimeMs });
+        } catch { /* ignore */ }
+      }
+      if (candidates.length === 0) return null;
+      candidates.sort((a, b) => b.mtime - a.mtime);
+      return candidates[0].path;
+    } catch {
+      return null;
+    }
+  }
 
   const processLine = (line: string): void => {
     if (!line.trim()) {
       return;
     }
 
-    let parsed: unknown;
+    let parsed: OpenCodeEvent;
     try {
-      parsed = JSON.parse(line);
+      parsed = JSON.parse(line) as OpenCodeEvent;
     } catch {
+      const fallback = cleanAnsi(line, plainLogs);
+      if (fallback) {
+        const suffix = fallback.endsWith('\n') ? '' : '\n';
+        onData?.(fallback + suffix);
+      }
       return;
     }
 
@@ -214,40 +441,73 @@ export async function runOpenCode(options: RunOpenCodeOptions): Promise<RunOpenC
       }
     }
 
-    // Type guard for parsed JSON
-    if (typeof parsed !== 'object' || parsed === null) {
-      return;
-    }
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const parsedObj = parsed as Record<string, any>;
-
     let formatted: string | null = null;
-    switch (parsedObj.type) {
+    switch (parsed.type) {
       case 'tool_use':
-        formatted = formatToolUse(parsedObj.part, plainLogs);
+        formatted = formatToolUse(parsed.part as ToolPart | undefined, plainLogs);
         break;
       case 'step_start':
-        if (isFirstStep) {
-          isFirstStep = false;
-          formatted = formatStatus('OpenCode is analyzing your request...');
-        }
-        // Subsequent step_start events are silent
-        break;
       case 'step_finish':
-        formatted = formatStepEvent(parsedObj.type, parsedObj.part);
+        formatted = formatStepEvent(parsed.type ?? 'step_finish', parsed.part as StepPart | undefined);
         break;
       case 'text': {
-        const textPart = parsedObj.part;
+        const textPart = parsed.part as TextPart | undefined;
         const textValue =
           typeof textPart?.text === 'string'
             ? cleanAnsi(textPart.text, plainLogs)
             : '';
-        formatted = textValue ? formatMessage(textValue) : null;
+        if (textValue) {
+          const { delta, snapshot } = computeTextDelta(lastTextSnapshot, textValue);
+          lastTextSnapshot = snapshot;
+          const deduped = removeDuplicateParagraphs(delta, lastParagraph);
+          formatted = deduped || null;
+        }
         break;
       }
       case 'error':
-        formatted = formatErrorEvent(parsedObj.error, plainLogs);
+        formatted = formatErrorEvent(parsed.error ?? (parsed.part as ErrorPart | undefined), plainLogs);
         break;
+      case 'permission':
+      case 'permission.updated':
+      case 'permission.requested':
+      case 'permission_required': {
+        if (!pendingPermissionError) {
+          const payload = extractPermission(parsed);
+          if (payload && isPermissionPending(payload)) {
+            const metadata = payload.metadata ?? {};
+            const path = asString(metadata.path ?? metadata.target);
+            const message = payload.title ?? payload.type ?? payload.id ?? 'OpenCode permission required';
+            pendingPermissionError = new PermissionRequiredError(message, {
+              engine: 'opencode',
+              id: payload.id,
+              title: payload.title,
+              capability: payload.type,
+              pattern: payload.pattern,
+              path,
+              metadata,
+              raw: parsed,
+            });
+            try {
+              onData?.(formatStatus(`OpenCode requested approval: ${message}`) + '\n');
+            } catch {
+              // ignore log failures
+            }
+            if (capturedChild && !capturedChild.killed) {
+              try {
+                capturedChild.kill('SIGTERM');
+                setTimeout(() => {
+                  if (capturedChild && !capturedChild.killed) {
+                    capturedChild.kill('SIGKILL');
+                  }
+                }, 500);
+              } catch {
+                // ignore kill errors
+              }
+            }
+          }
+        }
+        break;
+      }
       default:
         break;
     }
@@ -280,15 +540,44 @@ export async function runOpenCode(options: RunOpenCodeOptions): Promise<RunOpenC
 
   let result;
   try {
+    // Heartbeat status while waiting for output
+    heartbeat = setInterval(() => {
+      const now = Date.now();
+      if (now - lastActivity > 10_000) {
+        try {
+          onData?.(formatStatus('Waiting on OpenCode response…') + '\n');
+        } catch {
+          // ignore
+        }
+        if (shouldTailDiagnostics && !diagNotified && (now - lastActivity) > 30_000) {
+          diagNotified = true;
+          getLatestOpenCodeLogPath().then(async (p) => {
+            if (!p) return;
+            try {
+              const { readFile } = await import('node:fs/promises');
+              const text = await readFile(p, 'utf8');
+              const lines = text.split('\n');
+              const tail = lines.slice(-60).join('\n');
+              onErrorData?.(`[OpenCode log tail] ${p}\n${tail}\n`);
+            } catch { /* ignore */ }
+          }).catch(() => {});
+        }
+        lastActivity = now; // throttle status lines
+      }
+    }, 10_000);
+
     result = await spawnProcess({
       command,
       args,
       cwd: workingDir,
       env: runnerEnv,
       stdinInput: prompt,
+      // Close stdin after writing the prompt to avoid CLIs waiting for EOF
+      keepStdinOpen: false,
       stdioMode: 'pipe',
       onStdout: (chunk) => {
         const normalized = normalizeChunk(chunk);
+        // Auto-approval path retained, but stdin is closed by default; env permission should prevent prompts.
         jsonBuffer += normalized;
 
         const lines = jsonBuffer.split('\n');
@@ -297,14 +586,19 @@ export async function runOpenCode(options: RunOpenCodeOptions): Promise<RunOpenC
         for (const line of lines) {
           processLine(line);
         }
+        lastActivity = Date.now();
       },
       onStderr: (chunk) => {
         const normalized = normalizeChunk(chunk);
         const cleaned = cleanAnsi(normalized, plainLogs);
         onErrorData?.(cleaned);
+        lastActivity = Date.now();
       },
       signal: abortSignal,
-      timeout,
+      timeout: effectiveTimeout,
+      onSpawn: (child) => {
+        capturedChild = child;
+      },
     });
   } catch (error) {
     const err = error as { code?: string; message?: string };
@@ -336,6 +630,12 @@ export async function runOpenCode(options: RunOpenCodeOptions): Promise<RunOpenC
     jsonBuffer = '';
   }
 
+  capturedChild = null;
+
+  if (pendingPermissionError) {
+    throw pendingPermissionError;
+  }
+
   if (result.exitCode !== 0) {
     const stderr = result.stderr.trim();
     const stdout = result.stdout.trim();
@@ -348,6 +648,10 @@ export async function runOpenCode(options: RunOpenCodeOptions): Promise<RunOpenC
     });
 
     throw new Error(`OpenCode CLI exited with code ${result.exitCode}`);
+  }
+
+  if (heartbeat) {
+    clearInterval(heartbeat);
   }
 
   telemetryCapture.logCapturedTelemetry(result.exitCode);

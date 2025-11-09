@@ -8,6 +8,7 @@ import { processPromptString } from '../../shared/prompts/index.js';
 import { resolvePlaceholderPath, loadPlaceholdersConfig } from '../../shared/prompts/config/loader.js';
 import * as logger from '../../shared/logging/logger.js';
 import chalk from 'chalk';
+import type { EngineType } from '../../infra/engines/index.js';
 
 export interface CoordinationExecutorOptions {
   /** Working directory for agent execution */
@@ -18,6 +19,9 @@ export interface CoordinationExecutorOptions {
 
   /** Optional logger for agent output */
   logger?: (agentName: string, chunk: string) => void;
+
+  /** Optional engine override shared by all commands */
+  engineOverride?: EngineType;
 }
 
 /**
@@ -137,6 +141,7 @@ export class CoordinationExecutor {
       const result = await executeAgent(command.name, compositePrompt, {
         workingDir: this.options.workingDir,
         parentId: this.options.parentId,
+        engine: this.options.engineOverride,
         displayPrompt: command.prompt, // Show user's actual request in logs, not full composite
         logger: suppressOutput
           ? () => {} // Silent logger when tail is active
